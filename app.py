@@ -23,22 +23,22 @@ genai.configure(api_key=os.environ["GEMINI_API_KEY"])
 THEMES = {
     "Corporativo": {
         "bg": "F7F8FA", "surface": "E6ECF4", "text": "1B2A41", "muted": "5C6B80",
-        "accent": "1F6FEB", "dark_bg": "0F2742", "dark_text": "FFFFFF",
+        "accent": "1F6FEB", "on_accent": "FFFFFF", "dark_bg": "0F2742", "dark_text": "FFFFFF",
         "dark_muted": "A9B8CC", "head_font": "Calibri", "body_font": "Calibri",
     },
     "Oscuro": {
         "bg": "12151C", "surface": "1E2430", "text": "E8ECF2", "muted": "98A2B3",
-        "accent": "34D1BF", "dark_bg": "0A0C10", "dark_text": "FFFFFF",
+        "accent": "34D1BF", "on_accent": "0A0C10", "dark_bg": "0A0C10", "dark_text": "FFFFFF",
         "dark_muted": "98A2B3", "head_font": "Calibri", "body_font": "Calibri",
     },
     "Creativo": {
         "bg": "FFF8F0", "surface": "FFE7D1", "text": "2B2118", "muted": "7A6A5A",
-        "accent": "F2542D", "dark_bg": "2B2118", "dark_text": "FFF8F0",
+        "accent": "F2542D", "on_accent": "FFFFFF", "dark_bg": "2B2118", "dark_text": "FFF8F0",
         "dark_muted": "D8C4B0", "head_font": "Georgia", "body_font": "Calibri",
     },
     "Elegante": {
         "bg": "FFFFFF", "surface": "F1EEF9", "text": "1A1A2E", "muted": "6B6B80",
-        "accent": "6D28D9", "dark_bg": "1A1033", "dark_text": "FFFFFF",
+        "accent": "6D28D9", "on_accent": "FFFFFF", "dark_bg": "1A1033", "dark_text": "FFFFFF",
         "dark_muted": "B9A9E0", "head_font": "Georgia", "body_font": "Calibri",
     },
 }
@@ -46,6 +46,25 @@ THEMES = {
 # Lienzo 16:9 (13.333" x 7.5")
 SLIDE_W, SLIDE_H = 13.333, 7.5
 MARGIN_X = 0.9
+
+# Catálogo de iconos: nombre que Gemini puede elegir -> forma nativa de PowerPoint
+ICONS = {
+    "energia": MSO_SHAPE.LIGHTNING_BOLT,
+    "proceso": MSO_SHAPE.GEAR_6,
+    "meta": MSO_SHAPE.STAR_5_POINT,
+    "salud": MSO_SHAPE.HEART,
+    "ambiente": MSO_SHAPE.SUN,
+    "tecnologia": MSO_SHAPE.CLOUD,
+    "crecimiento": MSO_SHAPE.UP_ARROW,
+    "datos": MSO_SHAPE.CAN,
+    "estructura": MSO_SHAPE.CUBE,
+    "ciclo": MSO_SHAPE.CIRCULAR_ARROW,
+    "valor": MSO_SHAPE.DIAMOND,
+    "agua": MSO_SHAPE.TEAR,
+    "tiempo": MSO_SHAPE.MOON,
+    "avance": MSO_SHAPE.RIGHT_ARROW,
+    "general": MSO_SHAPE.HEXAGON,
+}
 
 VALID_LAYOUTS = {"portada", "contenido", "dos_columnas", "dato_grande", "cita", "cierre"}
 
@@ -72,6 +91,12 @@ Reglas que debes seguir SIEMPRE, sin excepción:
 - No repitas la misma idea en dos diapositivas distintas.
 - Elige para cada diapositiva el "layout" que mejor encaje con su contenido
   y VARÍALOS: no uses el mismo layout en más de dos diapositivas seguidas.
+
+Además, TODAS las diapositivas (excepto "cita") deben incluir el campo
+"icon" con UNO de estos nombres, el que mejor represente su tema:
+energia, proceso, meta, salud, ambiente, tecnologia, crecimiento, datos,
+estructura, ciclo, valor, agua, tiempo, avance, general.
+Varía los iconos; evita repetir el mismo en diapositivas seguidas.
 
 Layouts disponibles y los campos que requiere cada uno:
 - "portada": SOLO la primera diapositiva. Campos: title, bullets (1 bullet
@@ -110,22 +135,22 @@ importante separar correctamente los materiales desde el hogar.
 EXAMPLE_OUTPUT = {
     "deck_title": "El reciclaje",
     "slides": [
-        {"layout": "portada", "title": "El reciclaje",
+        {"layout": "portada", "title": "El reciclaje", "icon": "ciclo",
          "bullets": ["Convertir desechos en nuevos productos"]},
-        {"layout": "contenido", "title": "Beneficios ambientales",
+        {"layout": "contenido", "title": "Beneficios ambientales", "icon": "ambiente",
          "bullets": ["Reduce el uso de energía",
                      "Disminuye la contaminación del aire y el agua",
                      "Reduce las emisiones de gases de efecto invernadero"]},
-        {"layout": "dato_grande", "title": "Ahorro de energía",
+        {"layout": "dato_grande", "title": "Ahorro de energía", "icon": "energia",
          "stat": "60%", "stat_label": "de energía ahorrada al reciclar papel",
          "bullets": ["Menos materia prima nueva", "Menos emisiones en producción"]},
-        {"layout": "dos_columnas", "title": "Qué reciclar y cómo",
+        {"layout": "dos_columnas", "title": "Qué reciclar y cómo", "icon": "estructura",
          "columns": [
              {"heading": "Materiales comunes",
               "bullets": ["Papel y cartón", "Vidrio", "Plástico y metales"]},
              {"heading": "Buenas prácticas",
               "bullets": ["Separar desde el hogar", "Limpiar los envases"]}]},
-        {"layout": "cierre", "title": "Conclusión",
+        {"layout": "cierre", "title": "Conclusión", "icon": "meta",
          "bullets": ["El reciclaje reduce el impacto ambiental",
                      "La separación correcta desde el hogar es clave"]},
     ],
@@ -202,7 +227,12 @@ def normalize_slide(raw, index, total):
     elif layout in ("portada", "cierre"):
         layout = "contenido"
 
+    icon = str(raw.get("icon", "")).strip().lower()
+    if icon not in ICONS:
+        icon = "general"
+
     slide = {
+        "icon": icon,
         "layout": layout,
         "title": str(raw.get("title", "Sin título")).strip() or "Sin título",
         "bullets": clean_list(raw.get("bullets"), 5),
@@ -325,12 +355,27 @@ def add_footer(slide, t, deck_title, number, dark=False):
              color, t["body_font"], align=PP_ALIGN.RIGHT)
 
 
-def add_title(slide, t, title, color=None):
-    """Título + barrita de acento: mismo patrón en todas las diapositivas."""
-    add_text(slide, MARGIN_X, 0.65, SLIDE_W - 2 * MARGIN_X, 1.1, title,
+def add_icon(slide, t, name, x, y, d=0.95):
+    """Icono: círculo de color de acento con una forma nativa dentro."""
+    shape = ICONS.get(name)
+    if shape is None:
+        return
+    add_rect(slide, x, y, d, d, t["accent"], MSO_SHAPE.OVAL)
+    inner = d * 0.5
+    add_rect(slide, x + (d - inner) / 2, y + (d - inner) / 2, inner, inner,
+             t.get("on_accent", "FFFFFF"), shape)
+
+
+def add_title(slide, t, title, color=None, icon=None):
+    """Título + barrita de acento + icono a la derecha."""
+    icon_d = 0.95
+    title_w = SLIDE_W - 2 * MARGIN_X - (icon_d + 0.4 if icon else 0)
+    add_text(slide, MARGIN_X, 0.65, title_w, 1.1, title,
              title_size(title), color or t["text"], t["head_font"], bold=True,
              anchor=MSO_ANCHOR.BOTTOM)
     add_rect(slide, MARGIN_X, 1.95, 1.2, 0.08, t["accent"])
+    if icon:
+        add_icon(slide, t, icon, SLIDE_W - MARGIN_X - icon_d, 0.8, icon_d)
 
 
 # ---------------------------------------------------------------------
@@ -339,18 +384,19 @@ def add_title(slide, t, title, color=None):
 def layout_portada(slide, t, s):
     set_bg(slide, t["dark_bg"])
     add_rect(slide, 0, 0, 0.35, SLIDE_H, t["accent"])
-    add_text(slide, 1.2, 1.9, 10.5, 2.6, s["title"], title_size(s["title"], 54),
+    add_text(slide, 1.2, 1.9, 8.0, 2.6, s["title"], title_size(s["title"], 50),
              t["dark_text"], t["head_font"], bold=True, anchor=MSO_ANCHOR.BOTTOM)
     add_rect(slide, 1.2, 4.75, 1.6, 0.1, t["accent"])
     if s["bullets"]:
-        add_text(slide, 1.2, 5.1, 10.5, 1.0, s["bullets"][0], 22,
+        add_text(slide, 1.2, 5.1, 8.0, 1.0, s["bullets"][0], 22,
                  t["dark_muted"], t["body_font"])
+    add_icon(slide, t, s["icon"], 9.9, 2.4, 2.5)
 
 
 def layout_contenido(slide, t, s):
     set_bg(slide, t["bg"])
     add_rect(slide, 0, 0, 0.25, SLIDE_H, t["accent"])
-    add_title(slide, t, s["title"])
+    add_title(slide, t, s["title"], icon=s["icon"])
     bullet_rows(slide, MARGIN_X, 2.4, SLIDE_W - 2 * MARGIN_X, 4.3, s["bullets"],
                 bullet_size(s["bullets"]), t["text"], t["accent"], t["body_font"])
 
@@ -358,7 +404,7 @@ def layout_contenido(slide, t, s):
 def layout_dos_columnas(slide, t, s):
     set_bg(slide, t["bg"])
     add_rect(slide, 0, 0, 0.25, SLIDE_H, t["accent"])
-    add_title(slide, t, s["title"])
+    add_title(slide, t, s["title"], icon=s["icon"])
     card_w = (SLIDE_W - 2 * MARGIN_X - 0.4) / 2
     for i, col in enumerate(s["columns"]):
         x = MARGIN_X + i * (card_w + 0.4)
@@ -374,7 +420,7 @@ def layout_dos_columnas(slide, t, s):
 def layout_dato_grande(slide, t, s):
     set_bg(slide, t["bg"])
     add_rect(slide, 0, 0, 0.25, SLIDE_H, t["accent"])
-    add_title(slide, t, s["title"])
+    add_title(slide, t, s["title"], icon=s["icon"])
     stat_size = 96 if len(s["stat"]) <= 5 else 72 if len(s["stat"]) <= 8 else 54
     add_text(slide, MARGIN_X, 2.5, 5.6, 2.0, s["stat"], stat_size, t["accent"],
              t["head_font"], bold=True, anchor=MSO_ANCHOR.MIDDLE)
@@ -405,7 +451,7 @@ def layout_cita(slide, t, s):
 def layout_cierre(slide, t, s):
     set_bg(slide, t["dark_bg"])
     add_rect(slide, 0, 0, 0.35, SLIDE_H, t["accent"])
-    add_title(slide, t, s["title"], color=t["dark_text"])
+    add_title(slide, t, s["title"], color=t["dark_text"], icon=s["icon"])
     bullet_rows(slide, MARGIN_X + 0.3, 2.4, SLIDE_W - 2 * MARGIN_X - 0.6, 4.3,
                 s["bullets"], bullet_size(s["bullets"]), t["dark_text"],
                 t["accent"], t["body_font"])
