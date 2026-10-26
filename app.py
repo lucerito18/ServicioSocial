@@ -1,522 +1,1202 @@
 import os
 import json
+import math
 import re
+import time
+import tempfile
+from html import escape, unescape
 
+import requests
 import gradio as gr
 import pdfplumber
 import google.generativeai as genai
+from PIL import Image
 from pptx import Presentation
-from pptx.util import Inches, Pt
+from pptx.util import Pt, Inches
 from pptx.dml.color import RGBColor
-from pptx.enum.shapes import MSO_SHAPE
+from pptx.enum.shapes import MSO_SHAPE, MSO_SHAPE_TYPE
+from pptx.enum.dml import MSO_FILL
 from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
 from pptx.oxml.ns import qn
+import io
 
 # La API key se lee de la variable de entorno configurada en Render
 genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+MODEL_NAME = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
 
-# ---------------------------------------------------------------------
-# 1. TEMAS (sistema de diseño)
-# ---------------------------------------------------------------------
-# Cada tema define colores y tipografías. Todo el diseño sale de aquí,
-# así que cambiar de tema cambia TODA la presentación de forma coherente.
-THEMES = {
-    "Corporativo": {
-        "bg": "F7F8FA", "surface": "E6ECF4", "text": "1B2A41", "muted": "5C6B80",
-        "accent": "1F6FEB", "on_accent": "FFFFFF", "dark_bg": "0F2742", "dark_text": "FFFFFF",
-        "dark_muted": "A9B8CC", "head_font": "Calibri", "body_font": "Calibri",
-    },
-    "Oscuro": {
-        "bg": "12151C", "surface": "1E2430", "text": "E8ECF2", "muted": "98A2B3",
-        "accent": "34D1BF", "on_accent": "0A0C10", "dark_bg": "0A0C10", "dark_text": "FFFFFF",
-        "dark_muted": "98A2B3", "head_font": "Calibri", "body_font": "Calibri",
-    },
-    "Creativo": {
-        "bg": "FFF8F0", "surface": "FFE7D1", "text": "2B2118", "muted": "7A6A5A",
-        "accent": "F2542D", "on_accent": "FFFFFF", "dark_bg": "2B2118", "dark_text": "FFF8F0",
-        "dark_muted": "D8C4B0", "head_font": "Georgia", "body_font": "Calibri",
-    },
-    "Elegante": {
-        "bg": "FFFFFF", "surface": "F1EEF9", "text": "1A1A2E", "muted": "6B6B80",
-        "accent": "6D28D9", "on_accent": "FFFFFF", "dark_bg": "1A1033", "dark_text": "FFFFFF",
-        "dark_muted": "B9A9E0", "head_font": "Georgia", "body_font": "Calibri",
-    },
-}
-
-# Lienzo 16:9 (13.333" x 7.5")
-SLIDE_W, SLIDE_H = 13.333, 7.5
-MARGIN_X = 0.9
-
-# Catálogo de iconos: nombre que Gemini puede elegir -> forma nativa de PowerPoint
-ICONS = {
-    "energia": MSO_SHAPE.LIGHTNING_BOLT,
-    "proceso": MSO_SHAPE.GEAR_6,
-    "meta": MSO_SHAPE.STAR_5_POINT,
-    "salud": MSO_SHAPE.HEART,
-    "ambiente": MSO_SHAPE.SUN,
-    "tecnologia": MSO_SHAPE.CLOUD,
-    "crecimiento": MSO_SHAPE.UP_ARROW,
-    "datos": MSO_SHAPE.CAN,
-    "estructura": MSO_SHAPE.CUBE,
-    "ciclo": MSO_SHAPE.CIRCULAR_ARROW,
-    "valor": MSO_SHAPE.DIAMOND,
-    "agua": MSO_SHAPE.TEAR,
-    "tiempo": MSO_SHAPE.MOON,
-    "avance": MSO_SHAPE.RIGHT_ARROW,
-    "general": MSO_SHAPE.HEXAGON,
-}
-
-VALID_LAYOUTS = {"portada", "contenido", "dos_columnas", "dato_grande", "cita", "cierre"}
+MAX_INTENTOS = 3      # cuántas veces el Jefe deja reintentar a un agente
+MAX_IMAGENES = 4      # imágenes máximas por presentación
+TITULO_FUENTES = "Fuentes y créditos"
+# Wikimedia pide identificar a quien usa su API. Opcional: define CONTACTO en Render.
+USER_AGENT = "PDF2SlidesAgents/1.0 (proyecto de servicio social; uso educativo) " + os.environ.get("CONTACTO", "")
 
 
-def rgb(hex_str):
-    return RGBColor.from_string(hex_str)
+# ----------------------------------------------------------------------
+# Utilidades
+# ----------------------------------------------------------------------
+def llamar_llm(system_instruction, prompt):
+    """Una llamada a Gemini. 'prompt' puede ser texto o una lista (texto + imágenes)."""
+    model = genai.GenerativeModel(MODEL_NAME, system_instruction=system_instruction)
+    return model.generate_content(prompt).text.strip()
 
 
-# ---------------------------------------------------------------------
-# 2. PROMPT (le pedimos al modelo que ELIJA el layout de cada diapositiva)
-# ---------------------------------------------------------------------
-SYSTEM_INSTRUCTION = """
-Eres un asistente experto en diseño de presentaciones. Tu trabajo es leer
-documentos y convertirlos en diapositivas claras, concisas y visualmente
-variadas, pensadas para explicarse en voz alta frente a una audiencia.
+def parsear_json(raw):
+    """Convierte la respuesta del modelo en JSON, quitando ``` si los puso."""
+    raw = re.sub(r"^```(?:json)?", "", raw.strip())
+    raw = re.sub(r"```$", "", raw).strip()
+    return json.loads(raw)
 
-Reglas que debes seguir SIEMPRE, sin excepción:
-- Responde ÚNICAMENTE con JSON válido. Nada de texto antes o después,
-  nada de explicaciones, nada de ``` ni marcado de código.
-- Escribe en español neutro, con tono claro y profesional.
-- Cada "title" debe tener máximo 8 palabras.
-- Cada bullet debe tener máximo 12 palabras: una frase corta, nunca un
-  párrafo ni una oración copiada tal cual del documento.
-- No repitas la misma idea en dos diapositivas distintas.
-- Elige para cada diapositiva el "layout" que mejor encaje con su contenido
-  y VARÍALOS: no uses el mismo layout en más de dos diapositivas seguidas.
 
-Además, TODAS las diapositivas (excepto "cita") deben incluir el campo
-"icon" con UNO de estos nombres, el que mejor represente su tema:
-energia, proceso, meta, salud, ambiente, tecnologia, crecimiento, datos,
-estructura, ciclo, valor, agua, tiempo, avance, general.
-Varía los iconos; evita repetir el mismo en diapositivas seguidas.
+def num_palabras(texto):
+    return len(str(texto).split())
 
-Layouts disponibles y los campos que requiere cada uno:
-- "portada": SOLO la primera diapositiva. Campos: title, bullets (1 bullet
-  como subtítulo).
-- "contenido": lista de ideas. Campos: title, bullets (3 a 5).
-- "dos_columnas": comparaciones, pros/contras, antes/después. Campos: title,
-  columns = [{"heading": "...", "bullets": ["..."]}, {"heading": "...",
-  "bullets": ["..."]}] (2 a 3 bullets por columna).
-- "dato_grande": cuando haya una cifra o porcentaje importante. Campos:
-  title, stat (la cifra, ej. "85%"), stat_label (qué significa, máx. 10
-  palabras), bullets (0 a 3 de contexto).
-- "cita": una frase textual o idea clave destacable. Campos: title (etiqueta
-  corta), quote (máx. 25 palabras), author (fuente, puede ir vacío).
-- "cierre": SOLO la última diapositiva. Campos: title, bullets (3 a 4 puntos
-  clave o conclusiones).
+
+def con_feedback(prompt, feedback):
+    """Si el Jefe rechazó un intento anterior, se lo decimos al agente."""
+    if not feedback:
+        return prompt
+    return (
+        prompt
+        + "\n\nIMPORTANTE: el Jefe rechazó tu intento anterior por estos motivos:\n"
+        + feedback
+        + "\nCorrígelo en este nuevo intento."
+    )
+
+
+def _chk(lista, regla, ok, detalle="", bloquea=True):
+    """Registra una revisión del Jefe. Si 'bloquea' es False, solo avisa (⚠️)."""
+    lista.append({"regla": regla, "ok": bool(ok), "detalle": "" if ok else (detalle or regla),
+                  "bloquea": bloquea})
+
+
+def _limpiar_html(s):
+    return re.sub(r"\s+", " ", unescape(re.sub(r"<[^>]+>", "", s or ""))).strip()
+
+
+def _recortar_texto(texto, limite=15000):
+    """Si el PDF es largo, conserva el inicio y el final (ahí suele estar la bibliografía)."""
+    if len(texto) <= limite:
+        return texto
+    return texto[:11500] + "\n[... texto omitido ...]\n" + texto[-3500:]
+
+
+def _referencia_en_texto(ref, texto_min):
+    """Guardia anti-invención: casi todas las palabras de la referencia deben estar en el PDF."""
+    palabras = re.findall(r"\w{4,}", ref.lower())
+    if not palabras:
+        return False
+    return sum(1 for w in palabras if w in texto_min) / len(palabras) >= 0.7
+
+
+# ---- estimación de si un texto cabe en su caja (sin renderizar) ----
+def _altura_in(textos, ancho_in, tam, espacio_pt, sangria_in):
+    cpl = max(1.0, (ancho_in - sangria_in) * 144 / tam)  # caracteres por línea aprox.
+    lineas = sum(max(1, math.ceil(len(t) / cpl)) for t in textos)
+    return lineas * tam * 1.2 / 72 + len(textos) * espacio_pt / 72
+
+
+def _mejor_tam(textos, ancho_emu, alto_emu, tams, espacio_pt=0, sangria_in=0.4):
+    ancho_in = ancho_emu / 914400 - 0.2
+    alto_in = alto_emu / 914400 - 0.1
+    for t in tams:
+        if _altura_in(textos, ancho_in, t, espacio_pt, sangria_in) <= alto_in * 0.95:
+            return t
+    return tams[-1]
+
+
+def _cabe(shape, sangria_in=0.4):
+    pars = shape.text_frame.paragraphs
+    textos = [p.text for p in pars]
+    tam = next((r.font.size.pt for p in pars for r in p.runs if r.font.size), 18)
+    esp = pars[0].space_after.pt if pars and pars[0].space_after is not None else 0
+    return _altura_in(textos, shape.width / 914400 - 0.2, tam, esp, sangria_in) <= shape.height / 914400 - 0.1
+
+
+# ----------------------------------------------------------------------
+# Acceso a Wikimedia Commons (imágenes con licencia libre y autor)
+# ----------------------------------------------------------------------
+def _licencia_libre(lic):
+    return bool(re.match(r"^(cc[\s-]|cc0|public domain|pd[\s-]|pd$|gfdl)", lic.strip().lower()))
+
+
+def buscar_commons(consulta, limite=8):
+    """Busca imágenes en Wikimedia Commons y devuelve solo las que traen autor y licencia libre."""
+    r = requests.get(
+        "https://commons.wikimedia.org/w/api.php",
+        params={
+            "action": "query", "generator": "search", "gsrsearch": consulta,
+            "gsrnamespace": 6, "gsrlimit": limite, "prop": "imageinfo",
+            "iiprop": "url|extmetadata|mime|size", "iiurlwidth": 800, "format": "json",
+        },
+        headers={"User-Agent": USER_AGENT}, timeout=20,
+    )
+    r.raise_for_status()
+    paginas = r.json().get("query", {}).get("pages", {}).values()
+    resultado = []
+    for pg in sorted(paginas, key=lambda x: x.get("index", 0)):
+        info = (pg.get("imageinfo") or [{}])[0]
+        meta = info.get("extmetadata", {})
+        if info.get("mime") not in ("image/jpeg", "image/png"):
+            continue
+        if info.get("width", 0) < 600 or info.get("height", 0) < 400:
+            continue
+        licencia = _limpiar_html(meta.get("LicenseShortName", {}).get("value", ""))
+        autor = _limpiar_html(meta.get("Artist", {}).get("value", ""))
+        if not licencia or not autor or not _licencia_libre(licencia):
+            continue
+        resultado.append({
+            "titulo": pg.get("title", "").replace("File:", ""),
+            "thumb": info.get("thumburl") or info.get("url"),
+            "pagina": info.get("descriptionurl", ""),
+            "autor": autor,
+            "licencia": licencia,
+            "descripcion": _limpiar_html(meta.get("ImageDescription", {}).get("value", ""))[:200],
+        })
+    return resultado
+
+
+def descargar_imagen(url):
+    r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=25)
+    r.raise_for_status()
+    mime = r.headers.get("Content-Type", "").split(";")[0]
+    if mime not in ("image/jpeg", "image/png"):
+        raise ValueError(f"tipo de imagen no soportado: {mime}")
+    if len(r.content) > 6_000_000:
+        raise ValueError("imagen demasiado pesada")
+    return r.content, mime
+
+
+# ----------------------------------------------------------------------
+# Agentes (cada uno hace UNA cosa y devuelve qué recibió/entregó/razonó)
+# ----------------------------------------------------------------------
+class Agente:
+    nombre = "Agente"
+    rol = ""
+
+    def ejecutar(self, entrada, feedback=None):
+        """Debe devolver {"salida", "recibio", "entrego", "razonamiento", "detalle", "notas"}"""
+        raise NotImplementedError
+
+
+class Lector(Agente):
+    nombre = "Lector"
+    rol = "Extrae el texto del PDF página por página (sin IA)"
+
+    def ejecutar(self, entrada, feedback=None):
+        paginas = []
+        with pdfplumber.open(entrada) as pdf:
+            for p in pdf.pages:
+                paginas.append(p.extract_text() or "")
+        texto = "\n".join(t for t in paginas if t)
+        vacias = sum(1 for t in paginas if not t)
+
+        lineas = []
+        for i, t in enumerate(paginas[:12], 1):
+            if t:
+                muestra = t[:300].replace("\n", " ").strip()
+                lineas.append(f"Pág. {i} ({len(t)} caracteres): {muestra}...")
+            else:
+                lineas.append(f"Pág. {i}: sin texto extraíble")
+        if len(paginas) > 12:
+            lineas.append(f"... y {len(paginas) - 12} páginas más")
+
+        return {
+            "salida": {"texto": texto, "paginas": len(paginas)},
+            "recibio": f"PDF: {os.path.basename(entrada)}",
+            "entrego": f"{len(paginas)} páginas, {len(texto)} caracteres de texto",
+            "razonamiento": (
+                "Abrí el PDF con pdfplumber, leí cada página en orden y uní el texto. "
+                "No usé IA: es extracción directa. Si hay páginas sin texto, suelen ser "
+                "imágenes escaneadas."
+            ),
+            "detalle": "\n".join(lineas),
+            "notas": f"{vacias} páginas sin texto extraíble",
+        }
+
+
+SYS_RECOPILADOR = """
+Eres un analista que lee documentos y extrae su información clave.
+Responde ÚNICAMENTE con JSON válido, sin texto extra ni marcado de código.
+Escribe en español neutro. No inventes información que no esté en el texto.
+Nunca inventes referencias bibliográficas: solo copia las que aparezcan en el documento.
 """
 
-model = genai.GenerativeModel(
-    "gemini-3.5-flash-lite",
-    system_instruction=SYSTEM_INSTRUCTION,
-    generation_config={"response_mime_type": "application/json"},
-)
 
-# Ejemplo fijo (few-shot): muestra el patrón exacto de salida esperado.
-EXAMPLE_INPUT = """
-El reciclaje es el proceso de convertir materiales de desecho en nuevos
-productos. Ayuda a reducir el consumo de materias primas frescas, reduce
-el uso de energía, reduce la contaminación del aire y del agua, y reduce
-las emisiones de gases de efecto invernadero. Reciclar una tonelada de
-papel ahorra cerca del 60% de la energía necesaria para fabricarlo desde
-cero. Los materiales más comunes que se reciclan son el papel, el vidrio,
-el plástico y los metales. Para que el reciclaje funcione bien, es
-importante separar correctamente los materiales desde el hogar.
+def _fmt_secciones(data):
+    partes = [
+        f"Título: {data.get('titulo_documento', '')}",
+        f"Subtítulo: {data.get('subtitulo', '')}",
+        f"Tema general: {data.get('tema_general', '')}",
+        "",
+    ]
+    for i, s in enumerate(data.get("secciones", []), 1):
+        partes.append(f"Tema {i}: {s.get('tema', '?')}")
+        for pt in s.get("puntos", []):
+            partes.append(f"   - {pt}")
+    partes.append("")
+    refs = data.get("referencias", [])
+    partes.append(f"Referencias citadas en el documento ({len(refs)}):")
+    partes += [f"   - {r}" for r in refs] or ["   (ninguna)"]
+    return "\n".join(partes)
+
+
+class Recopilador(Agente):
+    nombre = "Recopilador"
+    rol = "Resume el texto, lo agrupa en temas y recoge las referencias que cita el documento (IA)"
+
+    def ejecutar(self, entrada, feedback=None):
+        esquema = {
+            "titulo_documento": "título corto del documento (máx. 10 palabras)",
+            "subtitulo": "frase que resume de qué trata (máx. 15 palabras)",
+            "tema_general": "...",
+            "razonamiento": "1 o 2 frases: cómo agrupaste el contenido y por qué",
+            "secciones": [{"tema": "...", "puntos": ["...", "..."]}],
+            "referencias": ["referencia bibliográfica tal como aparece en el documento"],
+        }
+        prompt = (
+            "Lee el siguiente documento y extrae su información clave, agrupada "
+            "por temas (entre 4 y 8 temas, cada uno con 2 a 5 puntos).\n"
+            "En 'referencias' copia (máximo 8) las fuentes bibliográficas o autores citados que "
+            "aparezcan en el documento. Si el documento no cita ninguna, devuelve una lista vacía. "
+            "NO inventes ninguna.\n"
+            "Estructura exacta: " + json.dumps(esquema, ensure_ascii=False) + "\n\n"
+            'DOCUMENTO:\n"""\n' + _recortar_texto(entrada["texto"]) + '\n"""'
+        )
+        data = parsear_json(llamar_llm(SYS_RECOPILADOR, con_feedback(prompt, feedback)))
+        data.setdefault("referencias", [])
+        n_puntos = sum(len(s.get("puntos", [])) for s in data.get("secciones", []))
+        return {
+            "salida": data,
+            "recibio": f"{len(entrada['texto'])} caracteres de texto",
+            "entrego": (f"{len(data.get('secciones', []))} temas, {n_puntos} puntos clave, "
+                        f"{len(data['referencias'])} referencias"),
+            "razonamiento": data.get("razonamiento", ""),
+            "detalle": _fmt_secciones(data),
+            "notas": f"Tema general: {data.get('tema_general', '?')}",
+        }
+
+
+SYS_SECCIONADOR = """
+Eres un asistente experto en diseño de presentaciones. Decides cuántas
+diapositivas se necesitan, qué información va en cada una y en qué formato,
+pensando en explicarlas en voz alta frente a una audiencia.
+
+Reglas que debes seguir SIEMPRE:
+- Responde ÚNICAMENTE con JSON válido. Nada de texto extra ni ``` .
+- Español neutro, tono claro y profesional.
+- NO incluyas portada ni diapositiva de fuentes: otros agentes las crean.
+- Cada "title" máximo 8 palabras.
+- Cada diapositiva tiene un "tipo":
+    * "parrafo": un texto corrido de 25 a 55 palabras, redactado con fluidez
+      (nada de listas). Deja "bullets" vacío.
+    * "mixto": un "parrafo" corto (10 a 30 palabras) más 2 a 4 bullets.
+    * "bullets": 3 a 5 bullets (úsalo en máximo 2 diapositivas).
+  Al menos la mitad de las diapositivas deben ser "parrafo" o "mixto".
+- Cada bullet máximo 15 palabras, frase corta. No repitas ideas entre diapositivas.
+- La primera diapositiva presenta el tema general (introducción).
+- La última diapositiva es un resumen o conclusión.
+- "imagen_consulta": en 2 a 4 diapositivas, escribe una búsqueda corta EN INGLÉS
+  (2 a 5 palabras) de algo visual y concreto (un objeto, lugar, diagrama o escena
+  real) que ilustre directamente el tema de esa diapositiva. En las demás pon "".
+- Explica tu decisión en "razonamiento" y, en cada diapositiva, indica en
+  "origen" de qué tema(s) del resumen salió su contenido.
 """
 
-EXAMPLE_OUTPUT = {
-    "deck_title": "El reciclaje",
+EJEMPLO_SLIDES = {
+    "razonamiento": "Usé 2 diapositivas porque el texto es corto: una explicativa y una de cierre.",
     "slides": [
-        {"layout": "portada", "title": "El reciclaje", "icon": "ciclo",
-         "bullets": ["Convertir desechos en nuevos productos"]},
-        {"layout": "contenido", "title": "Beneficios ambientales", "icon": "ambiente",
-         "bullets": ["Reduce el uso de energía",
-                     "Disminuye la contaminación del aire y el agua",
-                     "Reduce las emisiones de gases de efecto invernadero"]},
-        {"layout": "dato_grande", "title": "Ahorro de energía", "icon": "energia",
-         "stat": "60%", "stat_label": "de energía ahorrada al reciclar papel",
-         "bullets": ["Menos materia prima nueva", "Menos emisiones en producción"]},
-        {"layout": "dos_columnas", "title": "Qué reciclar y cómo", "icon": "estructura",
-         "columns": [
-             {"heading": "Materiales comunes",
-              "bullets": ["Papel y cartón", "Vidrio", "Plástico y metales"]},
-             {"heading": "Buenas prácticas",
-              "bullets": ["Separar desde el hogar", "Limpiar los envases"]}]},
-        {"layout": "cierre", "title": "Conclusión", "icon": "meta",
-         "bullets": ["El reciclaje reduce el impacto ambiental",
-                     "La separación correcta desde el hogar es clave"]},
+        {
+            "title": "¿Qué es el reciclaje?",
+            "origen": "Tema 1: Definición",
+            "tipo": "parrafo",
+            "parrafo": "El reciclaje convierte materiales de desecho en nuevos productos. Así se "
+                       "reduce el consumo de materias primas y se disminuye la contaminación del aire "
+                       "y del agua, además de ahorrar energía en la producción.",
+            "bullets": [],
+            "imagen_consulta": "recycling bins sorting",
+        },
+        {
+            "title": "Conclusión",
+            "origen": "Temas 1 y 2: síntesis",
+            "tipo": "mixto",
+            "parrafo": "Reciclar bien empieza en casa y beneficia a todos.",
+            "bullets": ["Separar los materiales desde el hogar", "Reducir el impacto ambiental"],
+            "imagen_consulta": "",
+        },
     ],
 }
 
 
-def extract_text(pdf_path):
-    """Saca todo el texto del PDF, página por página."""
-    text_parts = []
-    with pdfplumber.open(pdf_path) as pdf:
-        for page in pdf.pages:
-            page_text = page.extract_text()
-            if page_text:
-                text_parts.append(page_text)
-    return "\n".join(text_parts)
+class Seccionador(Agente):
+    nombre = "Seccionador"
+    rol = "Decide cuántas diapositivas hay, qué formato y contenido lleva cada una y qué imagen buscar (IA)"
+
+    def ejecutar(self, entrada, feedback=None):
+        prompt = (
+            "Ejemplo del formato esperado (solo la estructura, no el contenido):\n"
+            + json.dumps(EJEMPLO_SLIDES, ensure_ascii=False)
+            + "\n\nAhora, con base en este resumen estructurado del documento, "
+            "arma entre 5 y 10 diapositivas de contenido. Devuelve SOLO el JSON "
+            '{"razonamiento": "...", "slides": [{"title": "...", "origen": "...", "tipo": "...", '
+            '"parrafo": "...", "bullets": ["..."], "imagen_consulta": "..."}]}.\n\n'
+            "RESUMEN:\n" + json.dumps({k: v for k, v in entrada.items() if k != "referencias"},
+                                       ensure_ascii=False)
+        )
+        data = parsear_json(llamar_llm(SYS_SECCIONADOR, con_feedback(prompt, feedback)))
+        slides = data["slides"]
+
+        detalle = []
+        for i, s in enumerate(slides, 1):
+            detalle.append(f"Diapositiva {i} [{s.get('tipo', '?')}]: {s.get('title', '?')}   "
+                           f"(origen: {s.get('origen', '-')})")
+            if s.get("parrafo"):
+                detalle.append(f"   Texto: {s['parrafo']}")
+            for b in s.get("bullets", []):
+                detalle.append(f"   - {b}")
+            if s.get("imagen_consulta"):
+                detalle.append(f"   Imagen a buscar: {s['imagen_consulta']}")
+
+        return {
+            "salida": {
+                "slides": slides,
+                "titulo": entrada.get("titulo_documento", "Presentación"),
+                "subtitulo": entrada.get("subtitulo", ""),
+                "tema_general": entrada.get("tema_general", ""),
+                "razonamiento": data.get("razonamiento", ""),
+            },
+            "recibio": f"{len(entrada.get('secciones', []))} temas del Recopilador",
+            "entrego": f"Plan de {len(slides)} diapositivas de contenido",
+            "razonamiento": data.get("razonamiento", ""),
+            "detalle": "\n".join(detalle),
+            "notas": " / ".join(s.get("title", "?") for s in slides),
+        }
 
 
-def ask_gemini_for_slides(text):
-    """Le pide a Gemini la estructura de diapositivas (JSON con layout por slide)."""
-    prompt = f"""
-A continuación tienes un ejemplo de cómo debes transformar un texto en
-diapositivas, siguiendo tus reglas:
-
-TEXTO DE EJEMPLO:
-\"\"\"{EXAMPLE_INPUT}\"\"\"
-
-SALIDA ESPERADA PARA ESE EJEMPLO:
-{json.dumps(EXAMPLE_OUTPUT, ensure_ascii=False)}
-
-Ahora haz exactamente lo mismo con el siguiente documento real. Genera
-entre 6 y 10 diapositivas (la primera "portada" y la última "cierre") y
-devuelve SOLO el JSON con la misma estructura: {{"deck_title": "...",
-"slides": [...]}}.
-
-DOCUMENTO REAL:
-\"\"\"
-{text[:15000]}
-\"\"\"
+SYS_ILUSTRADOR = """
+Eres un editor gráfico muy estricto. Eliges imágenes para diapositivas, pero solo
+si muestran de forma clara y directa el tema. Si hay duda, no eliges ninguna.
+Responde ÚNICAMENTE con JSON válido.
 """
-    response = model.generate_content(prompt)
-    raw = response.text.strip()
-
-    # Por si el modelo agrega ```json ... ``` a pesar de la instrucción
-    raw = re.sub(r"^```json", "", raw)
-    raw = re.sub(r"^```", "", raw)
-    raw = re.sub(r"```$", "", raw)
-    raw = raw.strip()
-
-    data = json.loads(raw)
-    if isinstance(data, list):  # por si devuelve solo la lista
-        data = {"slides": data}
-    return data.get("deck_title", ""), data["slides"]
 
 
-# ---------------------------------------------------------------------
-# 3. NORMALIZACIÓN: el JSON del modelo nunca debe romper el diseño
-# ---------------------------------------------------------------------
-def clean_list(items, max_items):
-    items = [str(i).strip() for i in (items or []) if str(i).strip()]
-    return items[:max_items]
+class Ilustrador(Agente):
+    nombre = "Ilustrador"
+    rol = ("Busca imágenes con licencia libre en Wikimedia Commons, verifica con IA (viendo la imagen) "
+           "que ilustren el tema y guarda autor y licencia")
+
+    def __init__(self, carpeta):
+        self.carpeta = carpeta
+
+    def _elegir(self, slide, candidatas):
+        texto = slide.get("parrafo") or " ".join(slide.get("bullets", []))
+        partes = [
+            f"Diapositiva: «{slide.get('title', '')}». Contenido: {texto}\n"
+            "Estas imágenes vienen de Wikimedia Commons. Elige la que muestre de forma clara y "
+            "directa el tema de la diapositiva. Descarta las que solo se relacionen vagamente, "
+            "logotipos, capturas con texto ilegible o imágenes que no se entiendan. Si NINGUNA "
+            'cumple, devuelve null. Responde {"elegida": <número de imagen o null>, '
+            '"razon": "<una frase: qué se ve y por qué se relaciona con el tema>"}'
+        ]
+        for k, c in enumerate(candidatas):
+            partes.append(f"Imagen {k} (archivo: {c['titulo']}):")
+            partes.append({"mime_type": c["mime"], "data": c["bytes"]})
+        d = parsear_json(llamar_llm(SYS_ILUSTRADOR, partes))
+        k = d.get("elegida")
+        if isinstance(k, int) and 0 <= k < len(candidatas):
+            return candidatas[k], d.get("razon", "")
+        return None, d.get("razon", "ninguna imagen ilustraba el tema con claridad")
+
+    def ejecutar(self, entrada, feedback=None):
+        slides = [dict(s) for s in entrada["slides"]]
+        indices = [i for i, s in enumerate(slides) if s.get("imagen_consulta")][:MAX_IMAGENES]
+        lineas, errores, elegidas = [], [], 0
+
+        for i in indices:
+            s = slides[i]
+            s.pop("imagen", None)
+            etiqueta = f"Diap. {i + 1} «{s.get('title', '')}» (búsqueda: {s['imagen_consulta']})"
+            try:
+                cands = buscar_commons(s["imagen_consulta"])
+                bajadas = []
+                for c in cands:
+                    if len(bajadas) >= 3:
+                        break
+                    try:
+                        datos, mime = descargar_imagen(c["thumb"])
+                        bajadas.append({**c, "bytes": datos, "mime": mime})
+                    except Exception:
+                        continue
+                if not bajadas:
+                    lineas.append(f"{etiqueta}: sin candidatas utilizables ({len(cands)} con licencia y autor)")
+                    continue
+                elegida, razon = self._elegir(s, bajadas)
+                if not elegida:
+                    lineas.append(f"{etiqueta}: ninguna sirvió → {razon}")
+                    continue
+                ext = ".png" if elegida["mime"] == "image/png" else ".jpg"
+                ruta = os.path.join(self.carpeta, f"imagen_{i + 1}{ext}")
+                with open(ruta, "wb") as f:
+                    f.write(elegida["bytes"])
+                ancho, alto = Image.open(io.BytesIO(elegida["bytes"])).size
+                s["imagen"] = {
+                    "ruta": ruta, "titulo": elegida["titulo"], "autor": elegida["autor"],
+                    "licencia": elegida["licencia"], "pagina": elegida["pagina"],
+                    "razon": razon, "ancho": ancho, "alto": alto,
+                }
+                elegidas += 1
+                lineas.append(f"{etiqueta}: ✔ {elegida['titulo']} — {elegida['autor']}, "
+                              f"{elegida['licencia']} → {razon}")
+            except Exception as e:
+                errores.append(str(e))
+                lineas.append(f"{etiqueta}: error ({type(e).__name__}: {e})")
+
+        if indices and len(errores) == len(indices):
+            raise RuntimeError("No se pudo consultar Wikimedia Commons: " + errores[0])
+
+        return {
+            "salida": {**entrada, "slides": slides},
+            "recibio": f"{len(indices)} búsquedas de imagen del Seccionador",
+            "entrego": f"{elegidas} imágenes aceptadas de {len(indices)} búsquedas",
+            "razonamiento": (
+                "Para cada búsqueda consulté Wikimedia Commons (solo imágenes con autor y licencia "
+                "libre), descargué hasta 3 candidatas y le pedí a la IA que las viera y eligiera solo "
+                "una que muestre claramente el tema; si ninguna lo hacía, esa diapositiva queda sin imagen."
+            ),
+            "detalle": "\n".join(lineas) or "El plan no pidió imágenes.",
+            "notas": "",
+        }
 
 
-def normalize_slide(raw, index, total):
-    """Garantiza que cada slide tenga los campos que su layout necesita."""
-    layout = raw.get("layout", "contenido")
-    if layout not in VALID_LAYOUTS:
-        layout = "contenido"
+def _sin_vineta(par):
+    """Quita la viñeta y la sangría de un párrafo (para texto corrido)."""
+    pPr = par._p.get_or_add_pPr()
+    pPr.set("marL", "0")
+    pPr.set("indent", "0")
+    if pPr.find(qn("a:buNone")) is None:
+        pPr.append(pPr.makeelement(qn("a:buNone"), {}))
 
-    # La primera es siempre portada y la última siempre cierre
-    if index == 0:
-        layout = "portada"
-    elif index == total - 1 and total > 1:
-        layout = "cierre"
-    elif layout in ("portada", "cierre"):
-        layout = "contenido"
 
-    icon = str(raw.get("icon", "")).strip().lower()
-    if icon not in ICONS:
-        icon = "general"
+def _escribir(tf, items):
+    """items = [(texto, con_vineta)]"""
+    tf.clear()
+    for k, (texto, vineta) in enumerate(items):
+        par = tf.paragraphs[0] if k == 0 else tf.add_paragraph()
+        par.text = texto
+        if not vineta:
+            _sin_vineta(par)
 
-    slide = {
-        "icon": icon,
-        "layout": layout,
-        "title": str(raw.get("title", "Sin título")).strip() or "Sin título",
-        "bullets": clean_list(raw.get("bullets"), 5),
-    }
 
-    if layout == "dos_columnas":
-        cols = raw.get("columns") or []
-        cols = [c for c in cols if isinstance(c, dict)][:2]
-        if len(cols) < 2:
-            layout = "contenido"
+def _corto(texto, n):
+    return texto if len(texto) <= n else texto[: n - 1].rstrip() + "…"
+
+
+class GeneradorPPTX(Agente):
+    nombre = "Generador PPTX"
+    rol = "Construye el archivo .pptx (portada, contenido, imágenes y fuentes) a partir del plan (sin IA)"
+
+    def __init__(self, ruta_salida):
+        self.ruta_salida = ruta_salida
+
+    def ejecutar(self, entrada, feedback=None):
+        prs = Presentation()
+        prs.slide_width = Inches(13.333)  # formato 16:9
+        prs.slide_height = Inches(7.5)
+
+        portada = prs.slides.add_slide(prs.slide_layouts[0])
+        portada.shapes.title.text = entrada["titulo"]
+        portada.placeholders[1].text = entrada["subtitulo"] or entrada.get("tema_general", "")
+
+        detalle = [f"Diapositiva 1 (portada): {entrada['titulo']}"]
+        creditos, n_imgs = [], 0
+        for i, info in enumerate(entrada["slides"], 1):
+            slide = prs.slides.add_slide(prs.slide_layouts[1])
+            slide.shapes.title.text = info.get("title", "Sin titulo")
+            tipo = info.get("tipo", "bullets")
+            items = []
+            if tipo in ("parrafo", "mixto") and info.get("parrafo"):
+                items.append((info["parrafo"], False))
+            if tipo in ("bullets", "mixto"):
+                items += [(b, True) for b in info.get("bullets", [])]
+            _escribir(slide.placeholders[1].text_frame, items)
+
+            marca = ""
+            img = info.get("imagen")
+            if img:
+                slide.shapes.add_picture(img["ruta"], Inches(8), Inches(2), width=Inches(4))
+                cap = slide.shapes.add_textbox(Inches(8), Inches(5.5), Inches(4), Inches(0.5))
+                cap.name = "Credito imagen"
+                cap.text_frame.text = (f"Imagen: {_corto(img['autor'], 45)} · {img['licencia']} · "
+                                       "Wikimedia Commons")
+                n_imgs += 1
+                creditos.append((i, img))
+                marca = " + imagen"
+            detalle.append(f"Diapositiva {i + 1} [{tipo}]: {info.get('title', '')}{marca}")
+
+        # Diapositiva final: fuentes de información y créditos de imágenes
+        fuentes = prs.slides.add_slide(prs.slide_layouts[1])
+        fuentes.shapes.title.text = TITULO_FUENTES
+        items = [("Fuentes de información", False),
+                 (f"Documento base: {entrada['titulo']} ({entrada.get('documento', 'PDF')})", False)]
+        refs = entrada.get("referencias", [])[:6]
+        if refs:
+            items += [(f"Citado en el documento: {_corto(r, 150)}", False) for r in refs]
         else:
-            slide["columns"] = [
-                {"heading": str(c.get("heading", "")).strip(),
-                 "bullets": clean_list(c.get("bullets"), 4)}
-                for c in cols
-            ]
-
-    if layout == "dato_grande":
-        stat = str(raw.get("stat", "")).strip()
-        if not stat:
-            layout = "contenido"
+            items.append(("El documento base no cita referencias bibliográficas.", False))
+        items.append(("Créditos de imágenes", False))
+        if creditos:
+            for n, img in creditos:
+                titulo_archivo = _corto(img["titulo"], 60)
+                items.append((_corto(f"Diap. {n}: «{titulo_archivo}» — {img['autor']}, {img['licencia']}. "
+                                     f"{img['pagina']}", 220), False))
         else:
-            slide["stat"] = stat
-            slide["stat_label"] = str(raw.get("stat_label", "")).strip()
-            slide["bullets"] = clean_list(raw.get("bullets"), 3)
+            items.append(("Esta presentación no incluye imágenes de terceros.", False))
+        _escribir(fuentes.placeholders[1].text_frame, items)
+        detalle.append(f"Diapositiva {len(entrada['slides']) + 2} (fuentes): {len(refs)} referencias, "
+                       f"{len(creditos)} créditos de imagen")
 
-    if layout == "cita":
-        quote = str(raw.get("quote", "")).strip()
-        if not quote:
-            layout = "contenido"
-        else:
-            slide["quote"] = quote
-            slide["author"] = str(raw.get("author", "")).strip()
-
-    slide["layout"] = layout
-    return slide
-
-
-# ---------------------------------------------------------------------
-# 4. BLOQUES DE DISEÑO REUTILIZABLES
-# ---------------------------------------------------------------------
-def set_bg(slide, color):
-    fill = slide.background.fill
-    fill.solid()
-    fill.fore_color.rgb = rgb(color)
-
-
-def add_rect(slide, x, y, w, h, color, shape=MSO_SHAPE.RECTANGLE):
-    shp = slide.shapes.add_shape(shape, Inches(x), Inches(y), Inches(w), Inches(h))
-    shp.fill.solid()
-    shp.fill.fore_color.rgb = rgb(color)
-    shp.line.fill.background()  # sin borde
-    shp.shadow.inherit = False
-    # Quitamos el estilo por defecto del tema de Office (sombras/bordes),
-    # para que el diseño se vea plano y limpio en PowerPoint y LibreOffice.
-    style = shp._element.find(qn("p:style"))
-    if style is not None:
-        shp._element.remove(style)
-    return shp
+        prs.save(self.ruta_salida)
+        total = len(entrada["slides"]) + 2
+        return {
+            "salida": {
+                "ruta": self.ruta_salida, "n_slides": total, "n_imagenes": n_imgs,
+                "titulo": entrada["titulo"], "tema": entrada.get("tema_general", ""),
+            },
+            "recibio": f"Plan de {len(entrada['slides'])} diapositivas, {n_imgs} imágenes y referencias",
+            "entrego": f"Archivo {os.path.basename(self.ruta_salida)} con {total} diapositivas "
+                       "(portada + contenido + fuentes)",
+            "razonamiento": (
+                "Creé la portada, luego una diapositiva por elemento del plan: texto corrido sin viñetas "
+                "en las de tipo 'parrafo', viñetas en las de tipo 'bullets', y ambos en 'mixto'. "
+                "Inserté cada imagen con su crédito y cerré con la diapositiva de fuentes, armada solo con "
+                "datos verificados (documento, referencias presentes en el PDF y créditos de las imágenes). "
+                "Aún sin estilo: eso lo hace el Decorador."
+            ),
+            "detalle": "\n".join(detalle),
+            "notas": "",
+        }
 
 
-def add_text(slide, x, y, w, h, text, size, color, font, bold=False,
-             italic=False, align=PP_ALIGN.LEFT, anchor=MSO_ANCHOR.TOP):
-    box = slide.shapes.add_textbox(Inches(x), Inches(y), Inches(w), Inches(h))
-    tf = box.text_frame
-    tf.word_wrap = True
-    tf.vertical_anchor = anchor
-    tf.margin_left = tf.margin_right = Inches(0)
-    tf.margin_top = tf.margin_bottom = Inches(0)
-    p = tf.paragraphs[0]
-    p.alignment = align
-    run = p.add_run()
-    run.text = text
-    run.font.size = Pt(size)
-    run.font.bold = bold
-    run.font.italic = italic
-    run.font.name = font
-    run.font.color.rgb = rgb(color)
-    return box
-
-
-def title_size(title, base=36):
-    """Reduce el tamaño del título si es largo, para que no se desborde."""
-    n = len(title)
-    if n > 60:
-        return base - 8
-    if n > 40:
-        return base - 4
-    return base
-
-
-def bullet_size(bullets, base=28):
-    """Ajusta el tamaño de letra según cuántos bullets hay y cuán largos son."""
-    n = len(bullets)
-    size = base if n <= 3 else base - 2 if n == 4 else base - 4
-    if any(len(b) > 70 for b in bullets):
-        size -= 2
-    return max(size, 14)
-
-
-def bullet_rows(slide, x, y, w, h, bullets, size, text_color, dot_color,
-                font, max_row_h=1.0):
-    """Cada bullet es una fila: punto de color + texto centrado verticalmente."""
-    if not bullets:
-        return
-    row_h = min(max_row_h, h / len(bullets))
-    dot = 0.16
-    for i, b in enumerate(bullets):
-        top = y + i * row_h
-        add_rect(slide, x, top + row_h / 2 - dot / 2, dot, dot, dot_color,
-                 MSO_SHAPE.OVAL)
-        add_text(slide, x + 0.45, top, w - 0.45, row_h, b, size, text_color,
-                 font, anchor=MSO_ANCHOR.MIDDLE)
-
-
-def add_footer(slide, t, deck_title, number, dark=False):
-    color = t["dark_muted"] if dark else t["muted"]
-    add_text(slide, MARGIN_X, 6.95, 8, 0.3, deck_title, 11, color, t["body_font"])
-    add_text(slide, SLIDE_W - MARGIN_X - 1, 6.95, 1, 0.3, str(number), 11,
-             color, t["body_font"], align=PP_ALIGN.RIGHT)
-
-
-def add_icon(slide, t, name, x, y, d=0.95):
-    """Icono: círculo de color de acento con una forma nativa dentro."""
-    shape = ICONS.get(name)
-    if shape is None:
-        return
-    add_rect(slide, x, y, d, d, t["accent"], MSO_SHAPE.OVAL)
-    inner = d * 0.5
-    add_rect(slide, x + (d - inner) / 2, y + (d - inner) / 2, inner, inner,
-             t.get("on_accent", "FFFFFF"), shape)
-
-
-def add_title(slide, t, title, color=None, icon=None):
-    """Título + barrita de acento + icono a la derecha."""
-    icon_d = 0.95
-    title_w = SLIDE_W - 2 * MARGIN_X - (icon_d + 0.4 if icon else 0)
-    add_text(slide, MARGIN_X, 0.65, title_w, 1.1, title,
-             title_size(title), color or t["text"], t["head_font"], bold=True,
-             anchor=MSO_ANCHOR.BOTTOM)
-    add_rect(slide, MARGIN_X, 1.95, 1.2, 0.08, t["accent"])
-    if icon:
-        add_icon(slide, t, icon, SLIDE_W - MARGIN_X - icon_d, 0.8, icon_d)
-
-
-# ---------------------------------------------------------------------
-# 5. LAYOUTS (uno por tipo de contenido)
-# ---------------------------------------------------------------------
-def layout_portada(slide, t, s):
-    set_bg(slide, t["dark_bg"])
-    add_rect(slide, 0, 0, 0.35, SLIDE_H, t["accent"])
-    add_text(slide, 1.2, 1.9, 8.0, 2.6, s["title"], title_size(s["title"], 50),
-             t["dark_text"], t["head_font"], bold=True, anchor=MSO_ANCHOR.BOTTOM)
-    add_rect(slide, 1.2, 4.75, 1.6, 0.1, t["accent"])
-    if s["bullets"]:
-        add_text(slide, 1.2, 5.1, 8.0, 1.0, s["bullets"][0], 22,
-                 t["dark_muted"], t["body_font"])
-    add_icon(slide, t, s["icon"], 9.9, 2.4, 2.5)
-
-
-def layout_contenido(slide, t, s):
-    set_bg(slide, t["bg"])
-    add_rect(slide, 0, 0, 0.25, SLIDE_H, t["accent"])
-    add_title(slide, t, s["title"], icon=s["icon"])
-    bullet_rows(slide, MARGIN_X, 2.4, SLIDE_W - 2 * MARGIN_X, 4.3, s["bullets"],
-                bullet_size(s["bullets"]), t["text"], t["accent"], t["body_font"])
-
-
-def layout_dos_columnas(slide, t, s):
-    set_bg(slide, t["bg"])
-    add_rect(slide, 0, 0, 0.25, SLIDE_H, t["accent"])
-    add_title(slide, t, s["title"], icon=s["icon"])
-    card_w = (SLIDE_W - 2 * MARGIN_X - 0.4) / 2
-    for i, col in enumerate(s["columns"]):
-        x = MARGIN_X + i * (card_w + 0.4)
-        add_rect(slide, x, 2.4, card_w, 4.25, t["surface"],
-                 MSO_SHAPE.ROUNDED_RECTANGLE).adjustments[0] = 0.04
-        add_text(slide, x + 0.35, 2.65, card_w - 0.7, 0.6, col["heading"], 22,
-                 t["accent"], t["head_font"], bold=True)
-        bullet_rows(slide, x + 0.35, 3.4, card_w - 0.7, 3.0, col["bullets"],
-                    bullet_size(col["bullets"], 20), t["text"], t["accent"],
-                    t["body_font"], max_row_h=0.9)
-
-
-def layout_dato_grande(slide, t, s):
-    set_bg(slide, t["bg"])
-    add_rect(slide, 0, 0, 0.25, SLIDE_H, t["accent"])
-    add_title(slide, t, s["title"], icon=s["icon"])
-    stat_size = 96 if len(s["stat"]) <= 5 else 72 if len(s["stat"]) <= 8 else 54
-    add_text(slide, MARGIN_X, 2.5, 5.6, 2.0, s["stat"], stat_size, t["accent"],
-             t["head_font"], bold=True, anchor=MSO_ANCHOR.MIDDLE)
-    if s["stat_label"]:
-        add_text(slide, MARGIN_X, 4.6, 5.6, 1.4, s["stat_label"], 20,
-                 t["muted"], t["body_font"])
-    if s["bullets"]:
-        add_rect(slide, 6.9, 2.5, 0.04, 3.8, t["surface"])
-        bullet_rows(slide, 7.3, 2.5, 5.1, 3.8, s["bullets"],
-                    bullet_size(s["bullets"], 22), t["text"], t["accent"],
-                    t["body_font"])
-
-
-def layout_cita(slide, t, s):
-    set_bg(slide, t["dark_bg"])
-    add_text(slide, 1.2, 0.6, 3, 1.8, "\u201C", 150, t["accent"], t["head_font"],
-             bold=True)
-    q = s["quote"]
-    q_size = 36 if len(q) < 90 else 30 if len(q) < 160 else 26
-    add_text(slide, 1.5, 2.3, SLIDE_W - 3.0, 3.0, q, q_size, t["dark_text"],
-             t["head_font"], italic=True, anchor=MSO_ANCHOR.MIDDLE)
-    if s["author"]:
-        add_rect(slide, 1.5, 5.5, 0.8, 0.06, t["accent"])
-        add_text(slide, 1.5, 5.7, SLIDE_W - 3.0, 0.5, s["author"], 18,
-                 t["dark_muted"], t["body_font"])
-
-
-def layout_cierre(slide, t, s):
-    set_bg(slide, t["dark_bg"])
-    add_rect(slide, 0, 0, 0.35, SLIDE_H, t["accent"])
-    add_title(slide, t, s["title"], color=t["dark_text"], icon=s["icon"])
-    bullet_rows(slide, MARGIN_X + 0.3, 2.4, SLIDE_W - 2 * MARGIN_X - 0.6, 4.3,
-                s["bullets"], bullet_size(s["bullets"]), t["dark_text"],
-                t["accent"], t["body_font"])
-
-
-LAYOUT_FUNCS = {
-    "portada": layout_portada,
-    "contenido": layout_contenido,
-    "dos_columnas": layout_dos_columnas,
-    "dato_grande": layout_dato_grande,
-    "cita": layout_cita,
-    "cierre": layout_cierre,
+PALETAS = {
+    "oceano": {"portada": (0x0B, 0x3C, 0x5D), "fondo": (0xF7, 0xFA, 0xFC), "titulo": (0x0B, 0x3C, 0x5D),
+               "texto": (0x2B, 0x35, 0x40), "acento": (0x32, 0x82, 0xB8), "acento2": (0x7F, 0xC4, 0xE8),
+               "tinte": (0xDC, 0xEC, 0xF6)},
+    "bosque": {"portada": (0x1B, 0x4D, 0x2E), "fondo": (0xF6, 0xFA, 0xF6), "titulo": (0x1B, 0x4D, 0x2E),
+               "texto": (0x2A, 0x33, 0x2C), "acento": (0x4C, 0xAF, 0x50), "acento2": (0xA5, 0xD6, 0xA7),
+               "tinte": (0xE0, 0xF0, 0xE0)},
+    "atardecer": {"portada": (0x7A, 0x24, 0x0E), "fondo": (0xFF, 0xF8, 0xF1), "titulo": (0x7A, 0x24, 0x0E),
+                  "texto": (0x3A, 0x2E, 0x2A), "acento": (0xE6, 0x7E, 0x22), "acento2": (0xF5, 0xB7, 0x6B),
+                  "tinte": (0xFB, 0xE5, 0xD0)},
+    "grafito": {"portada": (0x22, 0x22, 0x2B), "fondo": (0xF5, 0xF5, 0xF7), "titulo": (0x22, 0x22, 0x2B),
+                "texto": (0x3C, 0x3C, 0x44), "acento": (0x6C, 0x5C, 0xE7), "acento2": (0xB1, 0xA8, 0xF5),
+                "tinte": (0xE6, 0xE3, 0xFA)},
 }
+BLANCO = (0xFF, 0xFF, 0xFF)
+ENCABEZADOS_FUENTES = ("Fuentes de información", "Créditos de imágenes")
 
-DARK_LAYOUTS = {"portada", "cita", "cierre"}
-
-
-def build_pptx(slides_data, output_path, theme_name="Corporativo", deck_title=""):
-    """Arma el .pptx dibujando cada diapositiva con su layout y el tema elegido."""
-    t = THEMES.get(theme_name, THEMES["Corporativo"])
-    prs = Presentation()
-    prs.slide_width = Inches(SLIDE_W)
-    prs.slide_height = Inches(SLIDE_H)
-    blank = prs.slide_layouts[6]  # layout en blanco: dibujamos todo nosotros
-
-    total = len(slides_data)
-    slides = [normalize_slide(s, i, total) for i, s in enumerate(slides_data)]
-    deck_title = deck_title or slides[0]["title"]
-
-    for i, s in enumerate(slides):
-        slide = prs.slides.add_slide(blank)
-        LAYOUT_FUNCS[s["layout"]](slide, t, s)
-        if s["layout"] != "portada":
-            add_footer(slide, t, deck_title, i + 1, dark=s["layout"] in DARK_LAYOUTS)
-
-    prs.save(output_path)
+SYS_DECORADOR = """
+Eres un diseñador de presentaciones. Eliges la paleta de colores que mejor
+va con el tema del documento. Responde ÚNICAMENTE con JSON válido.
+"""
 
 
-def process_pdf(pdf_file, theme_name):
+def _rgb(t):
+    return RGBColor(*t)
+
+
+def _forma(slide, tipo, x, y, w, h, color, atras=True):
+    """Dibuja una forma de color sin borde ni sombra; opcionalmente detrás del texto."""
+    f = slide.shapes.add_shape(tipo, int(x), int(y), int(w), int(h))
+    f.fill.solid()
+    f.fill.fore_color.rgb = _rgb(color)
+    f.line.fill.background()
+    f.shadow.inherit = False
+    estilo = f._element.find(qn("p:style"))  # quita sombras/bordes heredados del tema
+    if estilo is not None:
+        f._element.remove(estilo)
+    if atras:
+        arbol = slide.shapes._spTree
+        arbol.remove(f._element)
+        arbol.insert(2, f._element)
+    return f
+
+
+def _colocar(shape, x, y, w, h):
+    shape.left, shape.top, shape.width, shape.height = int(x), int(y), int(w), int(h)
+
+
+def _estilo(shape, tam, color, negrita=False, alinear=PP_ALIGN.LEFT,
+            anclaje=MSO_ANCHOR.MIDDLE, espacio=0, cursiva=False):
+    tf = shape.text_frame
+    tf.word_wrap = True
+    tf.vertical_anchor = anclaje
+    for par in tf.paragraphs:
+        par.alignment = alinear
+        if espacio:
+            par.space_after = Pt(espacio)
+        for run in par.runs:
+            run.font.size = Pt(tam)
+            run.font.bold = negrita
+            run.font.italic = cursiva
+            run.font.color.rgb = _rgb(color)
+
+
+def _imagenes(slide):
+    return [sh for sh in slide.shapes if sh.shape_type == MSO_SHAPE_TYPE.PICTURE]
+
+
+class Decorador(Agente):
+    nombre = "Decorador"
+    rol = "Elige paleta (IA) y aplica diseño: portada, colores, tipografía, imágenes y formas (código)"
+
+    def ejecutar(self, entrada, feedback=None):
+        ruta, tema = entrada["ruta"], entrada["tema"]
+        nombre_paleta, motivo = "oceano", "paleta por defecto"
+        try:
+            prompt = (
+                f"Tema del documento: {tema}\n"
+                f"Paletas disponibles: {list(PALETAS)}\n"
+                'Responde {"paleta": "<nombre>", "motivo": "<una frase corta>"}'
+            )
+            d = parsear_json(llamar_llm(SYS_DECORADOR, prompt))
+            if d.get("paleta") in PALETAS:
+                nombre_paleta, motivo = d["paleta"], d.get("motivo", "")
+        except Exception as e:  # si la IA falla, no tiramos todo el proceso
+            motivo = f"la IA falló ({e}); usé la paleta por defecto"
+
+        p = PALETAS[nombre_paleta]
+        prs = Presentation(ruta)
+        W, H = prs.slide_width, prs.slide_height
+        total = len(prs.slides)
+        tamanos = []
+        for i, slide in enumerate(prs.slides):
+            slide.background.fill.solid()
+            if i == 0:
+                self._portada(slide, p, W, H)
+            else:
+                tam = self._contenido(slide, p, W, H, i, es_fuentes=(i == total - 1))
+                tamanos.append(f"Diap. {i + 1}: texto a {tam} pt"
+                               + (" (con imagen)" if _imagenes(slide) else ""))
+        prs.save(ruta)
+
+        detalle = (
+            f"Paleta elegida: {nombre_paleta}\n"
+            "Portada: fondo oscuro, dos círculos decorativos, título 44 pt en blanco, "
+            "línea de acento y subtítulo.\n"
+            "Contenido: fondo claro, barra lateral de acento, círculo suave en la esquina, título "
+            "con subrayado, número de diapositiva en un círculo. Las imágenes van a la derecha con "
+            "marco de color y su crédito debajo; el tamaño de letra se ajusta para que el texto quepa.\n"
+            "Diapositiva final: fuentes y créditos en letra pequeña con encabezados de color.\n"
+            + "\n".join(tamanos)
+        )
+        return {
+            "salida": {"ruta": ruta, "n_slides": total, "paleta": nombre_paleta},
+            "recibio": f"Archivo básico de {total} diapositivas",
+            "entrego": f"Mismo archivo con diseño aplicado (paleta '{nombre_paleta}')",
+            "razonamiento": motivo,
+            "detalle": detalle,
+            "notas": "",
+        }
+
+    def _portada(self, slide, p, W, H):
+        slide.background.fill.fore_color.rgb = _rgb(p["portada"])
+        _forma(slide, MSO_SHAPE.OVAL, W - Inches(4.6), -Inches(1.6), Inches(6.4), Inches(6.4), p["acento"])
+        _forma(slide, MSO_SHAPE.OVAL, W - Inches(3.0), H - Inches(3.0), Inches(4.4), Inches(4.4), p["acento2"])
+        _forma(slide, MSO_SHAPE.RECTANGLE, Inches(0.9), Inches(4.3), Inches(1.6), Inches(0.1), p["acento2"])
+
+        titulo = slide.shapes.title
+        _colocar(titulo, Inches(0.9), Inches(1.6), Inches(7.4), Inches(2.6))
+        tam_t = _mejor_tam([titulo.text], titulo.width, titulo.height, [44, 40, 36, 32], 0, 0)
+        _estilo(titulo, tam_t, BLANCO, negrita=True, anclaje=MSO_ANCHOR.BOTTOM)
+
+        sub = slide.placeholders[1]
+        _colocar(sub, Inches(0.9), Inches(4.6), Inches(7.4), Inches(1.6))
+        _estilo(sub, 22, p["acento2"], anclaje=MSO_ANCHOR.TOP)
+
+    def _contenido(self, slide, p, W, H, numero, es_fuentes=False):
+        slide.background.fill.fore_color.rgb = _rgb(p["fondo"])
+        _forma(slide, MSO_SHAPE.OVAL, W - Inches(2.6), -Inches(1.6), Inches(4.0), Inches(4.0), p["tinte"])
+        _forma(slide, MSO_SHAPE.RECTANGLE, 0, 0, Inches(0.3), H, p["acento"])
+        _forma(slide, MSO_SHAPE.RECTANGLE, Inches(0.9), Inches(1.7), Inches(1.4), Inches(0.08), p["acento"])
+
+        titulo = slide.shapes.title
+        _colocar(titulo, Inches(0.9), Inches(0.45), W - Inches(3.0), Inches(1.2))
+        tam_t = _mejor_tam([titulo.text], titulo.width, titulo.height, [34, 30, 28, 24], 0, 0)
+        _estilo(titulo, tam_t, p["titulo"], negrita=True)
+
+        cuerpo = slide.placeholders[1]
+        pics = _imagenes(slide)
+        top_cuerpo, alto_cuerpo = Inches(2.0), H - Inches(3.0)
+
+        if pics and not es_fuentes:
+            pic = pics[0]
+            img_w, img_h = Inches(4.9), Inches(3.5)
+            img_x = W - Inches(0.9) - img_w
+            pw, ph = pic.image.size
+            esc = min(img_w / pw, img_h / ph)
+            nw, nh = int(pw * esc), int(ph * esc)
+            _colocar(pic, img_x + (img_w - nw) / 2, top_cuerpo + (img_h - nh) / 2, nw, nh)
+            _forma(slide, MSO_SHAPE.RECTANGLE, pic.left + Inches(0.12), pic.top + Inches(0.12),
+                   nw, nh, p["acento2"])
+            for sh in slide.shapes:
+                if sh.name == "Credito imagen":
+                    _colocar(sh, img_x, pic.top + nh + Inches(0.22), img_w, Inches(0.7))
+                    _estilo(sh, 10, p["texto"], anclaje=MSO_ANCHOR.TOP, cursiva=True)
+            ancho_cuerpo = img_x - Inches(0.9) - Inches(0.4)
+        else:
+            ancho_cuerpo = W - Inches(1.8)
+        _colocar(cuerpo, Inches(0.9), top_cuerpo, ancho_cuerpo, alto_cuerpo)
+
+        pars = cuerpo.text_frame.paragraphs
+        textos = [x.text for x in pars]
+        if es_fuentes:
+            espacio, tams = 4, [18, 16, 14, 13, 12, 11, 10]
+        elif len(pars) == 1 and not pics:
+            espacio, tams = 12, [28, 26, 24, 22, 20, 18]   # texto corrido a ancho completo
+        else:
+            espacio, tams = 12, [24, 22, 20, 18, 16, 14]
+        tam = _mejor_tam(textos, cuerpo.width, cuerpo.height, tams, espacio)
+        solo_texto = len(pars) == 1 and not pics and not es_fuentes
+        _estilo(cuerpo, tam, p["texto"], anclaje=MSO_ANCHOR.MIDDLE if solo_texto else MSO_ANCHOR.TOP,
+                espacio=espacio)
+
+        if es_fuentes:
+            for par in pars:
+                _sin_vineta(par)
+                if par.text in ENCABEZADOS_FUENTES:
+                    for run in par.runs:
+                        run.font.bold = True
+                        run.font.size = Pt(tam + 3)
+                        run.font.color.rgb = _rgb(p["acento"])
+
+        circulo = _forma(slide, MSO_SHAPE.OVAL, W - Inches(1.1), H - Inches(0.95),
+                         Inches(0.6), Inches(0.6), p["acento"], atras=False)
+        tf = circulo.text_frame
+        tf.text = str(numero)
+        par = tf.paragraphs[0]
+        par.alignment = PP_ALIGN.CENTER
+        run = par.runs[0]
+        run.font.size = Pt(14)
+        run.font.bold = True
+        run.font.color.rgb = _rgb(BLANCO)
+        return tam
+
+
+# ----------------------------------------------------------------------
+# El Jefe: coordina, valida, manda a corregir y, si hace falta, corrige él
+# ----------------------------------------------------------------------
+class ErrorPipeline(Exception):
+    pass
+
+
+class Jefe:
+    nombre = "Jefe"
+    rol = "Supervisa y corrige a los agentes"
+
+    def __init__(self):
+        self.log = []
+        self.t_inicio = time.time()
+        self.texto_pdf = ""
+
+    # ---- bitácora ----
+    def _anotar(self, agente, rol, intento, estado, segundos, res=None, revisiones=None, notas=""):
+        res = res or {}
+        self.log.append(
+            {
+                "paso": len(self.log) + 1,
+                "agente": agente,
+                "rol": rol,
+                "intento": intento,
+                "estado": estado,
+                "recibio": res.get("recibio", "-"),
+                "entrego": res.get("entrego", "-"),
+                "razonamiento": res.get("razonamiento", ""),
+                "detalle": res.get("detalle", ""),
+                "notas": notas or res.get("notas", ""),
+                "revisiones": revisiones or [],
+                "segundos": round(segundos, 1),
+            }
+        )
+
+    # ---- reglas de supervisión: devuelven lista de revisiones ----
+    def revisar(self, nombre, s):
+        c = []
+        if nombre == "Lector":
+            _chk(c, "Texto extraído suficiente (al menos 200 caracteres)",
+                 len(s["texto"].strip()) >= 200, "Texto casi vacío (¿PDF escaneado como imagen?)")
+        elif nombre == "Recopilador":
+            secciones = s.get("secciones", [])
+            _chk(c, "Trae título y subtítulo del documento",
+                 s.get("titulo_documento") and s.get("subtitulo"), "Falta 'titulo_documento' o 'subtitulo'")
+            _chk(c, "Título de máximo 12 palabras",
+                 num_palabras(s.get("titulo_documento", "")) <= 12, "El título del documento es muy largo")
+            _chk(c, "Trae tema general", s.get("tema_general"), "Falta 'tema_general'")
+            _chk(c, "Explica su razonamiento", s.get("razonamiento"), "Falta el campo 'razonamiento'")
+            _chk(c, "Al menos 3 temas", len(secciones) >= 3,
+                 f"Hay {len(secciones)} temas; extrae al menos 3")
+            sin_puntos = [x.get("tema", "?") for x in secciones if not x.get("puntos")]
+            _chk(c, "Todos los temas tienen puntos", not sin_puntos, f"Temas sin puntos: {sin_puntos}")
+            refs = s.get("referencias", [])
+            _chk(c, "'referencias' es una lista de máximo 8", isinstance(refs, list) and len(refs) <= 8,
+                 "'referencias' debe ser una lista de máximo 8 elementos")
+            if isinstance(refs, list):
+                inventadas = [r for r in refs if not _referencia_en_texto(str(r), self.texto_pdf)]
+                _chk(c, "Todas las referencias aparecen realmente en el PDF (anti-invención)",
+                     not inventadas,
+                     f"Estas referencias no aparecen en el documento, quítalas: {inventadas}")
+        elif nombre == "Seccionador":
+            c += self._checks_plan(s["slides"], s.get("razonamiento"))
+        elif nombre == "Ilustrador":
+            imgs = [(i, x["imagen"]) for i, x in enumerate(s["slides"], 1) if x.get("imagen")]
+            _chk(c, f"Máximo {MAX_IMAGENES} imágenes", len(imgs) <= MAX_IMAGENES,
+                 f"Hay {len(imgs)} imágenes")
+            malas, sin_cred, sin_razon = [], [], []
+            for i, img in imgs:
+                try:
+                    with Image.open(img["ruta"]) as im:
+                        im.verify()
+                    if img["ancho"] < 400:
+                        malas.append(i)
+                except Exception:
+                    malas.append(i)
+                if not (img.get("autor") and img.get("licencia") and img.get("pagina")):
+                    sin_cred.append(i)
+                if not img.get("razon"):
+                    sin_razon.append(i)
+            _chk(c, "Cada imagen es un archivo legible de al menos 400 px de ancho", not malas,
+                 f"Imágenes ilegibles o muy pequeñas en las diapositivas {malas}")
+            _chk(c, "Cada imagen trae autor, licencia y enlace de origen", not sin_cred,
+                 f"Faltan datos de crédito en las diapositivas {sin_cred}")
+            _chk(c, "Cada imagen trae la justificación de por qué ilustra el tema", not sin_razon,
+                 f"Falta la justificación en las diapositivas {sin_razon}")
+            titulos = [img["titulo"] for _, img in imgs]
+            _chk(c, "No hay imágenes repetidas", len(titulos) == len(set(titulos)), "Imagen repetida")
+        elif nombre == "Generador PPTX":
+            existe = os.path.exists(s["ruta"])
+            _chk(c, "El archivo .pptx existe", existe, "No se creó el archivo")
+            if existe:
+                prs = Presentation(s["ruta"])
+                _chk(c, "El número de diapositivas coincide con el plan (portada + contenido + fuentes)",
+                     len(prs.slides) == s["n_slides"], "El número de diapositivas no coincide con el plan")
+                portada = prs.slides[0].shapes.title.text if len(prs.slides) else ""
+                _chk(c, "La primera diapositiva es la portada con el título",
+                     portada == s["titulo"], "La portada no tiene el título esperado")
+                ultima = prs.slides[-1].shapes.title.text if len(prs.slides) else ""
+                _chk(c, f"La última diapositiva es '{TITULO_FUENTES}'", ultima == TITULO_FUENTES,
+                     "Falta la diapositiva de fuentes al final")
+                n_pics = sum(len(_imagenes(sl)) for sl in prs.slides)
+                _chk(c, "Cada imagen del plan quedó insertada en su diapositiva",
+                     n_pics == s["n_imagenes"], f"Hay {n_pics} imágenes y el plan tenía {s['n_imagenes']}")
+        elif nombre == "Decorador":
+            prs = Presentation(s["ruta"])
+            W, H = prs.slide_width, prs.slide_height
+            _chk(c, "No cambió el número de diapositivas", len(prs.slides) == s["n_slides"],
+                 "Cambió el número de diapositivas")
+            sin_fondo = [i for i, sl in enumerate(prs.slides, 1) if sl.background.fill.type != MSO_FILL.SOLID]
+            _chk(c, "Todas las diapositivas tienen fondo aplicado", not sin_fondo,
+                 f"Sin fondo en las diapositivas: {sin_fondo}")
+            sin_formas = [i for i, sl in enumerate(prs.slides, 1) if len(sl.shapes) <= len(sl.placeholders)]
+            _chk(c, "Todas las diapositivas tienen elementos decorativos", not sin_formas,
+                 f"Sin decoración en las diapositivas: {sin_formas}")
+            fuera, solapa = [], []
+            for i, sl in enumerate(prs.slides, 1):
+                for pic in _imagenes(sl):
+                    if pic.left < 0 or pic.left + pic.width > W or pic.top + pic.height + Inches(0.8) > H:
+                        fuera.append(i)
+                    cuerpo = sl.placeholders[1]
+                    if cuerpo.left + cuerpo.width > pic.left:
+                        solapa.append(i)
+            _chk(c, "Las imágenes y sus créditos caben dentro de la diapositiva", not fuera,
+                 f"Imagen fuera de los márgenes en las diapositivas {fuera}")
+            _chk(c, "Las imágenes no se encimen con el texto", not solapa,
+                 f"La imagen se encima con el texto en las diapositivas {solapa}")
+            desborda = []
+            for i, sl in enumerate(prs.slides, 1):
+                if i == 1:
+                    continue
+                if not _cabe(sl.placeholders[1]) or not _cabe(sl.shapes.title, sangria_in=0):
+                    desborda.append(i)
+            _chk(c, "El texto cabe en su caja (estimación, conviene revisarlo en PowerPoint)",
+                 not desborda, f"Posible texto desbordado en las diapositivas {desborda}", bloquea=False)
+        return c
+
+    def _checks_plan(self, slides, razonamiento):
+        c = []
+        _chk(c, "Entre 5 y 10 diapositivas de contenido", 5 <= len(slides) <= 10,
+             f"Debe haber entre 5 y 10 diapositivas (hay {len(slides)})")
+        malos = [i for i, s in enumerate(slides, 1) if not s.get("title") or num_palabras(s["title"]) > 8]
+        _chk(c, "Títulos de máximo 8 palabras", not malos,
+             f"Títulos vacíos o de más de 8 palabras en las diapositivas {malos}")
+
+        tipos_mal = [i for i, s in enumerate(slides, 1) if s.get("tipo") not in ("parrafo", "mixto", "bullets")]
+        _chk(c, "Cada diapositiva tiene un 'tipo' válido (parrafo, mixto o bullets)", not tipos_mal,
+             f"'tipo' inválido o ausente en las diapositivas {tipos_mal}")
+
+        incoherentes = []
+        for i, s in enumerate(slides, 1):
+            t, par, bl = s.get("tipo"), s.get("parrafo", "") or "", s.get("bullets", []) or []
+            if t == "parrafo" and not 25 <= num_palabras(par) <= 55:
+                incoherentes.append(f"{i} (párrafo de {num_palabras(par)} palabras; debe tener 25 a 55)")
+            elif t == "mixto" and not (10 <= num_palabras(par) <= 30 and 2 <= len(bl) <= 4):
+                incoherentes.append(f"{i} (mixto: párrafo de 10 a 30 palabras y 2 a 4 bullets)")
+            elif t == "bullets" and not 3 <= len(bl) <= 5:
+                incoherentes.append(f"{i} (bullets: debe tener 3 a 5)")
+        _chk(c, "El contenido de cada diapositiva coincide con su tipo y sus límites", not incoherentes,
+             "Revisa las diapositivas: " + "; ".join(incoherentes))
+
+        con_texto = sum(1 for s in slides if s.get("tipo") in ("parrafo", "mixto"))
+        _chk(c, "Al menos la mitad de las diapositivas llevan texto corrido",
+             slides and con_texto * 2 >= len(slides),
+             f"Solo {con_texto} de {len(slides)} diapositivas llevan texto corrido; usa más 'parrafo' o 'mixto'")
+        solo_bullets = sum(1 for s in slides if s.get("tipo") == "bullets")
+        _chk(c, "Máximo 2 diapositivas solo con bullets", solo_bullets <= 2,
+             f"Hay {solo_bullets} diapositivas solo con bullets")
+
+        largos = [i for i, s in enumerate(slides, 1)
+                  if any(num_palabras(b) > 15 for b in (s.get("bullets") or []))]
+        _chk(c, "Bullets de máximo 15 palabras", not largos,
+             f"Bullets de más de 15 palabras en las diapositivas {largos}")
+        vistos, repetidos = set(), []
+        for i, s in enumerate(slides, 1):
+            for b in (s.get("bullets") or []):
+                clave = str(b).strip().lower()
+                if clave in vistos:
+                    repetidos.append(i)
+                vistos.add(clave)
+        _chk(c, "Sin bullets repetidos", not repetidos,
+             f"Bullets repetidos en las diapositivas {sorted(set(repetidos))}")
+
+        n_img = sum(1 for s in slides if s.get("imagen_consulta"))
+        _chk(c, "Pide imagen en 2 a 4 diapositivas", 2 <= n_img <= MAX_IMAGENES,
+             f"Hay {n_img} diapositivas con 'imagen_consulta'; deben ser entre 2 y {MAX_IMAGENES}")
+        largas = [i for i, s in enumerate(slides, 1) if num_palabras(s.get("imagen_consulta", "")) > 6]
+        _chk(c, "Las búsquedas de imagen son cortas (máximo 6 palabras)", not largas,
+             f"Búsquedas demasiado largas en las diapositivas {largas}")
+        sin_origen = [i for i, s in enumerate(slides, 1) if not s.get("origen")]
+        _chk(c, "Cada diapositiva indica de qué tema sale", not sin_origen,
+             f"Falta 'origen' en las diapositivas {sin_origen}")
+        _chk(c, "Explica su razonamiento", razonamiento, "Falta el campo 'razonamiento'")
+        return c
+
+    # ---- corrección directa del Jefe (cuando el agente ya no puede) ----
+    def _corregir_plan(self, salida):
+        cambios, vistos, nuevos = [], set(), []
+        slides = salida["slides"]
+        if len(slides) > 10:
+            cambios.append("recortó el plan a 10 diapositivas")
+        n_consultas = 0
+        for i, s in enumerate(slides[:10], 1):
+            t = " ".join(str(s.get("title", "Sin título")).split()[:8])
+            par = (s.get("parrafo") or "").strip()
+            if num_palabras(par) > 55:
+                par = " ".join(par.split()[:55]) + "…"
+                cambios.append(f"recortó el párrafo de la diapositiva {i}")
+            bullets = []
+            for b in (s.get("bullets") or []):
+                palabras = str(b).split()
+                if len(palabras) > 15:
+                    b = " ".join(palabras[:15]) + "…"
+                    cambios.append(f"recortó un bullet de la diapositiva {i}")
+                clave = b.strip().lower()
+                if clave in vistos:
+                    cambios.append(f"quitó un bullet repetido en la diapositiva {i}")
+                    continue
+                vistos.add(clave)
+                bullets.append(b)
+            if len(bullets) > 5:
+                bullets = bullets[:5]
+                cambios.append(f"dejó solo 5 bullets en la diapositiva {i}")
+            tipo = "mixto" if par and bullets else ("parrafo" if par else "bullets")
+            if tipo != s.get("tipo"):
+                cambios.append(f"ajustó el tipo de la diapositiva {i} a '{tipo}'")
+            consulta = " ".join(str(s.get("imagen_consulta") or "").split()[:6])
+            if consulta:
+                n_consultas += 1
+                if n_consultas > MAX_IMAGENES:
+                    consulta = ""
+                    cambios.append(f"quitó una búsqueda de imagen sobrante en la diapositiva {i}")
+            if not s.get("origen"):
+                cambios.append(f"marcó el origen faltante de la diapositiva {i}")
+            nuevos.append({"title": t, "tipo": tipo, "parrafo": par, "bullets": bullets,
+                           "origen": s.get("origen") or "(no indicado)", "imagen_consulta": consulta})
+        if n_consultas < 2:
+            for s in nuevos[1:]:
+                if n_consultas >= 2:
+                    break
+                if not s["imagen_consulta"]:
+                    s["imagen_consulta"] = s["title"]
+                    n_consultas += 1
+                    cambios.append(f"usó el título de «{s['title']}» como búsqueda de imagen")
+        razon = salida.get("razonamiento")
+        if not razon:
+            cambios.append("completó el razonamiento faltante")
+        return {**salida, "slides": nuevos, "razonamiento": razon or "(el agente no explicó su decisión)"}, cambios
+
+    # ---- ciclo de supervisión de un agente ----
+    def _supervisar(self, agente, entrada, opcional=False, respaldo=None):
+        feedback, res = None, None
+        for intento in range(1, MAX_INTENTOS + 1):
+            t0 = time.time()
+            res, revisiones = None, []
+            try:
+                res = agente.ejecutar(entrada, feedback)
+                revisiones = self.revisar(agente.nombre, res["salida"])
+            except Exception as e:
+                _chk(revisiones, "La ejecución termina sin errores", False, f"{type(e).__name__}: {e}")
+            dt = time.time() - t0
+            problemas = [r["detalle"] for r in revisiones if not r["ok"] and r["bloquea"]]
+
+            if not problemas:
+                self._anotar(agente.nombre, agente.rol, intento, "✅ Aprobado", dt, res, revisiones)
+                return res["salida"]
+
+            self._anotar(agente.nombre, agente.rol, intento, "❌ Rechazado por el Jefe", dt, res, revisiones,
+                         notas="Motivos: " + "; ".join(problemas))
+            feedback = "- " + "\n- ".join(problemas)
+
+        # Se acabaron los intentos: el Jefe interviene si puede
+        if agente.nombre == "Seccionador" and res:
+            nuevo, cambios = self._corregir_plan(res["salida"])
+            revisiones = self._checks_plan(nuevo["slides"], nuevo["razonamiento"])
+            if all(r["ok"] or not r["bloquea"] for r in revisiones):
+                self._anotar(
+                    self.nombre, self.rol, "-", "🛠️ Corrigió él mismo", 0,
+                    {
+                        "recibio": f"Plan rechazado {MAX_INTENTOS} veces",
+                        "entrego": f"Plan de {len(nuevo['slides'])} diapositivas corregido",
+                        "razonamiento": "El Seccionador no logró cumplir las reglas tras varios intentos, "
+                                        "así que apliqué los ajustes mínimos necesarios yo mismo.",
+                        "detalle": "\n".join(sorted(set(cambios))) or "ajustes menores",
+                    },
+                    revisiones,
+                )
+                return nuevo
+
+        if opcional and respaldo is not None:
+            self._anotar(self.nombre, self.rol, "-", "⚠️ Siguió sin este paso", 0,
+                         {"recibio": f"{agente.nombre} falló {MAX_INTENTOS} veces",
+                          "entrego": "Presentación sin imágenes",
+                          "razonamiento": "Las imágenes son un extra, no un requisito para tener una "
+                                          "presentación útil, así que continué sin ellas en vez de detener todo."},
+                         notas=feedback or "")
+            return respaldo
+
+        self._anotar(self.nombre, self.rol, "-", "🛑 Detuvo el proceso", 0,
+                     {"recibio": f"{agente.nombre} falló {MAX_INTENTOS} veces",
+                      "razonamiento": "No pude corregirlo yo mismo, así que detengo el proceso para no "
+                                      "entregar una presentación incorrecta."},
+                     notas=feedback or "")
+        raise ErrorPipeline(f"{agente.nombre} no logró entregar un resultado válido")
+
+    # ---- el flujo completo ----
+    def coordinar(self, pdf_path, ruta_pptx, carpeta):
+        lectura = self._supervisar(Lector(), pdf_path)
+        self.texto_pdf = lectura["texto"].lower()
+        resumen = self._supervisar(Recopilador(), lectura)
+        plan = self._supervisar(Seccionador(), resumen)
+        plan = {**plan, "documento": os.path.basename(pdf_path), "referencias": resumen.get("referencias", [])}
+        respaldo = {**plan, "slides": [{k: v for k, v in s.items() if k != "imagen"} for s in plan["slides"]]}
+        plan = self._supervisar(Ilustrador(carpeta), plan, opcional=True, respaldo=respaldo)
+        base = self._supervisar(GeneradorPPTX(ruta_pptx), plan)
+        final = self._supervisar(Decorador(), base)
+        return final["ruta"]
+
+    # ---- reporte para ti (el "jefe de jefes") ----
+    def reporte_html(self, exito):
+        e = escape
+        rechazos = sum(1 for x in self.log if "Rechazado" in x["estado"])
+        correcciones = sum(1 for x in self.log if "Corrigió" in x["estado"])
+        omitidos = sum(1 for x in self.log if "Siguió" in x["estado"])
+        total = round(time.time() - self.t_inicio, 1)
+        caja = "border:1px solid rgba(128,128,128,.4);border-radius:8px;margin:8px 0;padding:8px 12px;"
+        celda = "border:1px solid rgba(128,128,128,.35);padding:6px 8px;text-align:left;"
+
+        h = ["<div>"]
+        h.append("<h3>Informe final del Jefe</h3><ul>")
+        h.append(f"<li>Resultado: {'✅ presentación generada' if exito else '🛑 el proceso se detuvo'}</li>")
+        h.append(f"<li>Rechazos a agentes: {rechazos}</li>")
+        h.append(f"<li>Correcciones hechas por el Jefe: {correcciones}</li>")
+        h.append(f"<li>Pasos opcionales omitidos: {omitidos}</li>")
+        h.append(f"<li>Tiempo total: {total} s</li></ul>")
+
+        h.append("<h3>Resumen de la corrida</h3>")
+        h.append('<table style="border-collapse:collapse;width:100%;"><tr>'
+                 + "".join(f'<th style="{celda}">{t}</th>' for t in ["#", "Agente", "Intento", "Estado", "Seg"])
+                 + "</tr>")
+        for x in self.log:
+            h.append("<tr>" + "".join(
+                f'<td style="{celda}">{e(str(v))}</td>'
+                for v in [x["paso"], x["agente"], x["intento"], x["estado"], x["segundos"]]
+            ) + "</tr>")
+        h.append("</table>")
+
+        h.append("<h3>Detalle por agente (clic para abrir)</h3>")
+        for x in self.log:
+            abierto = " open" if any(k in x["estado"] for k in ("Rechazado", "Corrigió", "Detuvo", "Siguió")) else ""
+            h.append(f'<details{abierto} style="{caja}"><summary style="cursor:pointer;font-weight:600;">'
+                     f'#{x["paso"]} {e(x["agente"])} — {e(x["estado"])} '
+                     f'(intento {e(str(x["intento"]))}, {x["segundos"]} s)</summary>')
+            h.append(f'<p><b>Qué hace:</b> {e(x["rol"])}</p>')
+            h.append(f'<p><b>Recibió:</b> {e(x["recibio"])}</p>')
+            h.append(f'<p><b>Entregó:</b> {e(x["entrego"])}</p>')
+            if x["razonamiento"]:
+                h.append(f'<p><b>Razonamiento:</b> {e(x["razonamiento"])}</p>')
+            if x["notas"]:
+                h.append(f'<p><b>Notas:</b> {e(x["notas"])}</p>')
+            if x["detalle"]:
+                h.append('<p><b>Detalle del trabajo:</b></p>'
+                         f'<pre style="white-space:pre-wrap;margin:0;padding:8px;'
+                         f'border:1px solid rgba(128,128,128,.35);border-radius:6px;">{e(x["detalle"])}</pre>')
+            if x["revisiones"]:
+                h.append("<p><b>Revisiones del Jefe:</b></p><ul>")
+                for r in x["revisiones"]:
+                    marca = "✅" if r["ok"] else ("❌" if r["bloquea"] else "⚠️")
+                    extra = f" — {e(r['detalle'])}" if not r["ok"] else ""
+                    h.append(f"<li>{marca} {e(r['regla'])}{extra}</li>")
+                h.append("</ul>")
+            h.append("</details>")
+        h.append("</div>")
+        return "".join(h)
+
+
+# ----------------------------------------------------------------------
+# Interfaz
+# ----------------------------------------------------------------------
+def process_pdf(pdf_file):
     if pdf_file is None:
         raise gr.Error("Por favor sube un archivo PDF.")
 
-    text = extract_text(pdf_file)
-    if not text.strip():
-        raise gr.Error(
-            "No se pudo extraer texto de ese PDF (¿está escaneado como imagen?)."
-        )
+    carpeta = tempfile.mkdtemp()
+    ruta_pptx = os.path.join(carpeta, "presentacion_generada.pptx")
+    ruta_log = os.path.join(carpeta, "bitacora.json")
 
-    deck_title, slides_data = ask_gemini_for_slides(text)
+    jefe = Jefe()
+    try:
+        jefe.coordinar(pdf_file, ruta_pptx, carpeta)
+        exito = True
+    except ErrorPipeline:
+        exito = False
 
-    output_path = "/tmp/presentacion_generada.pptx"
-    build_pptx(slides_data, output_path, theme_name, deck_title)
+    with open(ruta_log, "w", encoding="utf-8") as f:
+        json.dump(jefe.log, f, ensure_ascii=False, indent=2)
 
-    return output_path
+    return (ruta_pptx if exito else None), jefe.reporte_html(exito), ruta_log
 
 
 demo = gr.Interface(
     fn=process_pdf,
-    inputs=[
-        gr.File(label="Sube tu PDF", file_types=[".pdf"]),
-        gr.Dropdown(choices=list(THEMES), value="Corporativo", label="Tema visual"),
+    inputs=gr.File(label="Sube tu PDF", file_types=[".pdf"]),
+    outputs=[
+        gr.File(label="Descarga tu presentación (.pptx)"),
+        gr.HTML(label="Informe del Jefe y bitácora de cada agente"),
+        gr.File(label="Bitácora completa (.json)"),
     ],
-    outputs=gr.File(label="Descarga tu presentación (.pptx)"),
-    title="Agente de IA: PDF a Diapositivas",
-    description="Sube un PDF, elige un tema y el agente generará una presentación con diseños variados.",
+    title="Sistema multiagente: PDF a Diapositivas",
+    description=(
+        "Sube un PDF. Seis agentes trabajan en cadena (Lector, Recopilador, Seccionador, "
+        "Ilustrador, Generador, Decorador) supervisados por un Jefe que valida, corrige y te "
+        "entrega un informe de quién hizo qué y por qué. Las imágenes vienen de Wikimedia Commons "
+        "con su crédito."
+    ),
     flagging_mode="never",
 )
 
